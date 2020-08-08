@@ -1,33 +1,42 @@
+use std::borrow::Cow;
+use std::io::BufRead;
 use std::io::Write;
 
-use ansi_term::Colour::{Blue, Yellow};
+use bytelines::ByteLines;
 use console::strip_ansi_codes;
-use itertools::Itertools;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::bat::assets::HighlightingAssets;
 use crate::cli;
 use crate::config::Config;
 use crate::draw;
+use crate::features;
+use crate::format;
 use crate::paint::Painter;
 use crate::parse;
-use crate::style;
+use crate::style::{self, DecorationStyle};
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum State {
+    CommitMeta,                // In commit metadata section
+    FileMeta, // In diff metadata section, between (possible) commit metadata and first hunk
+    HunkHeader, // In hunk metadata line
+    HunkZero, // In hunk; unchanged line
+    HunkMinus(Option<String>), // In hunk; removed line (raw_line)
+    HunkPlus(Option<String>), // In hunk; added line (raw_line)
+    Unknown,
+}
 
 #[derive(Debug, PartialEq)]
-pub enum State {
-    CommitMeta, // In commit metadata section
-    FileMeta,   // In diff metadata section, between commit metadata and first hunk
-    HunkMeta,   // In hunk metadata line
-    HunkZero,   // In hunk; unchanged line
-    HunkMinus,  // In hunk; removed line
-    HunkPlus,   // In hunk; added line
+pub enum Source {
+    GitDiff,     // Coming from a `git diff` command
+    DiffUnified, // Coming from a `diff -u` command
     Unknown,
 }
 
 impl State {
     fn is_in_hunk(&self) -> bool {
         match *self {
-            State::HunkMeta | State::HunkZero | State::HunkMinus | State::HunkPlus => true,
+            State::HunkHeader | State::HunkZero | State::HunkMinus(_) | State::HunkPlus(_) => true,
             _ => false,
         }
     }
@@ -36,171 +45,453 @@ impl State {
 // Possible transitions, with actions on entry:
 //
 //
-// | from \ to  | CommitMeta  | FileMeta    | HunkMeta    | HunkZero    | HunkMinus   | HunkPlus |
-// |------------+-------------+-------------+-------------+-------------+-------------+----------|
-// | CommitMeta | emit        | emit        |             |             |             |          |
-// | FileMeta   |             | emit        | emit        |             |             |          |
-// | HunkMeta   |             |             |             | emit        | push        | push     |
-// | HunkZero   | emit        | emit        | emit        | emit        | push        | push     |
-// | HunkMinus  | flush, emit | flush, emit | flush, emit | flush, emit | push        | push     |
-// | HunkPlus   | flush, emit | flush, emit | flush, emit | flush, emit | flush, push | push     |
+// | from \ to   | CommitMeta  | FileMeta    | HunkHeader  | HunkZero    | HunkMinus   | HunkPlus |
+// |-------------+-------------+-------------+-------------+-------------+-------------+----------|
+// | CommitMeta  | emit        | emit        |             |             |             |          |
+// | FileMeta    |             | emit        | emit        |             |             |          |
+// | HunkHeader  |             |             |             | emit        | push        | push     |
+// | HunkZero    | emit        | emit        | emit        | emit        | push        | push     |
+// | HunkMinus   | flush, emit | flush, emit | flush, emit | flush, emit | push        | push     |
+// | HunkPlus    | flush, emit | flush, emit | flush, emit | flush, emit | flush, push | push     |
 
 pub fn delta<I>(
-    lines: I,
-    config: &Config,
-    assets: &HighlightingAssets,
+    mut lines: ByteLines<I>,
     writer: &mut dyn Write,
+    config: &Config,
 ) -> std::io::Result<()>
 where
-    I: Iterator<Item = String>,
+    I: BufRead,
 {
-    let mut painter = Painter::new(writer, config, assets);
+    let mut painter = Painter::new(writer, config);
     let mut minus_file = "".to_string();
-    let mut plus_file;
+    let mut plus_file = "".to_string();
     let mut state = State::Unknown;
+    let mut source = Source::Unknown;
 
-    for raw_line in lines {
+    // When a file is modified, we use lines starting with '---' or '+++' to obtain the file name.
+    // When a file is renamed without changes, we use lines starting with 'rename' to obtain the
+    // file name (there is no diff hunk and hence no lines starting with '---' or '+++'). But when
+    // a file is renamed with changes, both are present, and we rely on the following variables to
+    // avoid emitting the file meta header line twice (#245).
+    let mut current_file_pair;
+    let mut handled_file_meta_header_line_file_pair = None;
+
+    while let Some(Ok(raw_line_bytes)) = lines.next() {
+        let raw_line = String::from_utf8_lossy(&raw_line_bytes);
         let line = strip_ansi_codes(&raw_line).to_string();
+        if source == Source::Unknown {
+            source = detect_source(&line);
+        }
         if line.starts_with("commit ") {
-            painter.paint_buffered_lines();
+            painter.paint_buffered_minus_and_plus_lines();
             state = State::CommitMeta;
-            if config.opt.commit_style != cli::SectionStyle::Plain {
+            if should_handle(&state, config) {
                 painter.emit()?;
-                handle_commit_meta_header_line(&mut painter, &raw_line, config)?;
+                handle_commit_meta_header_line(&mut painter, &line, &raw_line, config)?;
                 continue;
             }
-        } else if line.starts_with("diff --git ") {
-            painter.paint_buffered_lines();
+        } else if line.starts_with("diff ") {
+            painter.paint_buffered_minus_and_plus_lines();
             state = State::FileMeta;
-            painter.syntax = match parse::get_file_extension_from_diff_line(&line) {
-                Some(extension) => assets.syntax_set.find_syntax_by_extension(extension),
-                None => None,
-            };
-        } else if (line.starts_with("--- ") || line.starts_with("rename from "))
-            && config.opt.file_style != cli::SectionStyle::Plain
+            handled_file_meta_header_line_file_pair = None;
+        } else if (state == State::FileMeta || source == Source::DiffUnified)
+            && (line.starts_with("--- ") || line.starts_with("rename from "))
         {
-            minus_file = parse::get_file_path_from_file_meta_line(&line);
-        } else if (line.starts_with("+++ ") || line.starts_with("rename to "))
-            && config.opt.file_style != cli::SectionStyle::Plain
-        {
-            plus_file = parse::get_file_path_from_file_meta_line(&line);
-            painter.emit()?;
-            handle_file_meta_header_line(&mut painter, &minus_file, &plus_file, config)?;
-        } else if line.starts_with("@@ ") {
-            state = State::HunkMeta;
-            if painter.syntax.is_some() {
-                painter.reset_highlighter();
+            minus_file = parse::get_file_path_from_file_meta_line(&line, source == Source::GitDiff);
+            if source == Source::DiffUnified {
+                state = State::FileMeta;
+                painter.set_syntax(parse::get_file_extension_from_marker_line(&line));
+            } else {
+                painter.set_syntax(parse::get_file_extension_from_file_meta_line_file_path(
+                    &minus_file,
+                ));
             }
-            if config.opt.hunk_style != cli::SectionStyle::Plain {
+        } else if (state == State::FileMeta || source == Source::DiffUnified)
+            && (line.starts_with("+++ ") || line.starts_with("rename to "))
+        {
+            plus_file = parse::get_file_path_from_file_meta_line(&line, source == Source::GitDiff);
+            painter.set_syntax(parse::get_file_extension_from_file_meta_line_file_path(
+                &plus_file,
+            ));
+            current_file_pair = Some((minus_file.clone(), plus_file.clone()));
+            if should_handle(&State::FileMeta, config)
+                && handled_file_meta_header_line_file_pair != current_file_pair
+            {
                 painter.emit()?;
-                handle_hunk_meta_line(&mut painter, &line, config)?;
+                handle_file_meta_header_line(
+                    &mut painter,
+                    &minus_file,
+                    &plus_file,
+                    config,
+                    source == Source::DiffUnified,
+                )?;
+                handled_file_meta_header_line_file_pair = current_file_pair
+            }
+        } else if line.starts_with("@@") {
+            painter.paint_buffered_minus_and_plus_lines();
+            state = State::HunkHeader;
+            painter.set_highlighter();
+            if should_handle(&state, config) {
+                painter.emit()?;
+                handle_hunk_header_line(&mut painter, &line, &raw_line, &plus_file, config)?;
                 continue;
             }
-        } else if state.is_in_hunk() && painter.syntax.is_some() {
-            state = handle_hunk_line(&mut painter, &line, state, config);
+        } else if source == Source::DiffUnified && line.starts_with("Only in ")
+            || line.starts_with("Submodule ")
+            || line.starts_with("Binary files ")
+        {
+            // Additional FileMeta cases:
+            //
+            // 1. When comparing directories with diff -u, if filenames match between the
+            //    directories, the files themselves will be compared. However, if an equivalent
+            //    filename is not present, diff outputs a single line (Only in...) starting
+            //    indicating that the file is present in only one of the directories.
+            //
+            // 2. Git diff emits lines describing submodule state such as "Submodule x/y/z contains
+            //    untracked content"
+            //
+            // See https://github.com/dandavison/delta/issues/60#issuecomment-557485242 for a
+            // proposal for more robust parsing logic.
+
+            painter.paint_buffered_minus_and_plus_lines();
+            state = State::FileMeta;
+            if should_handle(&State::FileMeta, config) {
+                painter.emit()?;
+                handle_generic_file_meta_header_line(&mut painter, &line, &raw_line, config)?;
+                continue;
+            }
+        } else if state.is_in_hunk() {
+            // A true hunk line should start with one of: '+', '-', ' '. However, handle_hunk_line
+            // handles all lines until the state machine transitions away from the hunk states.
+            state = handle_hunk_line(&mut painter, &line, &raw_line, state, config);
             painter.emit()?;
             continue;
         }
-        if state == State::FileMeta && config.opt.file_style != cli::SectionStyle::Plain {
+
+        if state == State::FileMeta && should_handle(&State::FileMeta, config) {
             // The file metadata section is 4 lines. Skip them under non-plain file-styles.
             continue;
         } else {
             painter.emit()?;
-            writeln!(painter.writer, "{}", raw_line)?;
+            writeln!(
+                painter.writer,
+                "{}",
+                format::format_raw_line(&raw_line, config)
+            )?;
         }
     }
 
-    painter.paint_buffered_lines();
+    painter.paint_buffered_minus_and_plus_lines();
     painter.emit()?;
     Ok(())
+}
+
+/// Should a handle_* function be called on this element?
+fn should_handle(state: &State, config: &Config) -> bool {
+    if *state == State::HunkHeader && config.line_numbers {
+        return true;
+    }
+    let style = config.get_style(state);
+    !(style.is_raw && style.decoration_style == DecorationStyle::NoDecoration)
+}
+
+/// Try to detect what is producing the input for delta.
+///
+/// Currently can detect:
+/// * git diff
+/// * diff -u
+fn detect_source(line: &str) -> Source {
+    if line.starts_with("commit ") || line.starts_with("diff --git ") {
+        Source::GitDiff
+    } else if line.starts_with("diff -u")
+        || line.starts_with("diff -ru")
+        || line.starts_with("diff -r -u")
+        || line.starts_with("diff -U")
+        || line.starts_with("--- ")
+        || line.starts_with("Only in ")
+    {
+        Source::DiffUnified
+    } else {
+        Source::Unknown
+    }
 }
 
 fn handle_commit_meta_header_line(
     painter: &mut Painter,
     line: &str,
+    raw_line: &str,
     config: &Config,
 ) -> std::io::Result<()> {
-    let draw_fn = match config.opt.commit_style {
-        cli::SectionStyle::Box => draw::write_boxed_with_line,
-        cli::SectionStyle::Underline => draw::write_underlined,
-        cli::SectionStyle::Plain => panic!(),
+    if config.commit_style.is_omitted {
+        return Ok(());
+    }
+    let decoration_ansi_term_style;
+    let mut pad = false;
+    let draw_fn = match config.commit_style.decoration_style {
+        DecorationStyle::Box(style) => {
+            pad = true;
+            decoration_ansi_term_style = style;
+            draw::write_boxed
+        }
+        DecorationStyle::BoxWithUnderline(style) => {
+            pad = true;
+            decoration_ansi_term_style = style;
+            draw::write_boxed_with_underline
+        }
+        DecorationStyle::BoxWithOverline(style) => {
+            pad = true;
+            decoration_ansi_term_style = style;
+            draw::write_boxed // TODO: not implemented
+        }
+        DecorationStyle::BoxWithUnderOverline(style) => {
+            pad = true;
+            decoration_ansi_term_style = style;
+            draw::write_boxed // TODO: not implemented
+        }
+        DecorationStyle::Underline(style) => {
+            decoration_ansi_term_style = style;
+            draw::write_underlined
+        }
+        DecorationStyle::Overline(style) => {
+            decoration_ansi_term_style = style;
+            draw::write_overlined
+        }
+        DecorationStyle::UnderOverline(style) => {
+            decoration_ansi_term_style = style;
+            draw::write_underoverlined
+        }
+        DecorationStyle::NoDecoration => {
+            decoration_ansi_term_style = ansi_term::Style::new();
+            draw::write_no_decoration
+        }
     };
+    let (formatted_line, formatted_raw_line) = if config.hyperlinks {
+        (
+            Cow::from(
+                features::hyperlinks::format_commit_line_with_osc8_commit_hyperlink(line, config),
+            ),
+            Cow::from(
+                features::hyperlinks::format_commit_line_with_osc8_commit_hyperlink(
+                    raw_line, config,
+                ),
+            ),
+        )
+    } else {
+        (Cow::from(line), Cow::from(raw_line))
+    };
+
     draw_fn(
         painter.writer,
-        line,
-        config.terminal_width,
-        Yellow.normal(),
-        true,
+        &format!("{}{}", formatted_line, if pad { " " } else { "" }),
+        &format!("{}{}", formatted_raw_line, if pad { " " } else { "" }),
+        &config.decorations_width,
+        config.commit_style,
+        decoration_ansi_term_style,
     )?;
     Ok(())
 }
 
+/// Construct file change line from minus and plus file and write with FileMeta styling.
 fn handle_file_meta_header_line(
     painter: &mut Painter,
     minus_file: &str,
     plus_file: &str,
     config: &Config,
+    comparing: bool,
 ) -> std::io::Result<()> {
-    let draw_fn = match config.opt.file_style {
-        cli::SectionStyle::Box => draw::write_boxed_with_line,
-        cli::SectionStyle::Underline => draw::write_underlined,
-        cli::SectionStyle::Plain => panic!(),
+    let line = parse::get_file_change_description_from_file_paths(
+        minus_file, plus_file, comparing, config,
+    );
+    // FIXME: no support for 'raw'
+    handle_generic_file_meta_header_line(painter, &line, &line, config)
+}
+
+/// Write `line` with FileMeta styling.
+fn handle_generic_file_meta_header_line(
+    painter: &mut Painter,
+    line: &str,
+    raw_line: &str,
+    config: &Config,
+) -> std::io::Result<()> {
+    if config.file_style.is_omitted {
+        return Ok(());
+    }
+    let decoration_ansi_term_style;
+    let mut pad = false;
+    let draw_fn = match config.file_style.decoration_style {
+        DecorationStyle::Box(style) => {
+            pad = true;
+            decoration_ansi_term_style = style;
+            draw::write_boxed
+        }
+        DecorationStyle::BoxWithUnderline(style) => {
+            pad = true;
+            decoration_ansi_term_style = style;
+            draw::write_boxed_with_underline
+        }
+        DecorationStyle::BoxWithOverline(style) => {
+            pad = true;
+            decoration_ansi_term_style = style;
+            draw::write_boxed // TODO: not implemented
+        }
+        DecorationStyle::BoxWithUnderOverline(style) => {
+            pad = true;
+            decoration_ansi_term_style = style;
+            draw::write_boxed // TODO: not implemented
+        }
+        DecorationStyle::Underline(style) => {
+            decoration_ansi_term_style = style;
+            draw::write_underlined
+        }
+        DecorationStyle::Overline(style) => {
+            decoration_ansi_term_style = style;
+            draw::write_overlined
+        }
+        DecorationStyle::UnderOverline(style) => {
+            decoration_ansi_term_style = style;
+            draw::write_underoverlined
+        }
+        DecorationStyle::NoDecoration => {
+            decoration_ansi_term_style = ansi_term::Style::new();
+            draw::write_no_decoration
+        }
     };
-    let ansi_style = Blue.normal();
     writeln!(painter.writer)?;
     draw_fn(
         painter.writer,
-        &ansi_style.paint(parse::get_file_change_description_from_file_paths(
-            minus_file, plus_file,
-        )),
-        config.terminal_width,
-        ansi_style,
-        false,
+        &format!("{}{}", line, if pad { " " } else { "" }),
+        &format!("{}{}", raw_line, if pad { " " } else { "" }),
+        &config.decorations_width,
+        config.file_style,
+        decoration_ansi_term_style,
     )?;
     Ok(())
 }
 
-fn handle_hunk_meta_line(
+fn handle_hunk_header_line(
     painter: &mut Painter,
     line: &str,
+    raw_line: &str,
+    plus_file: &str,
     config: &Config,
 ) -> std::io::Result<()> {
-    let draw_fn = match config.opt.hunk_style {
-        cli::SectionStyle::Box => draw::write_boxed,
-        cli::SectionStyle::Underline => draw::write_underlined,
-        cli::SectionStyle::Plain => panic!(),
+    if config.hunk_header_style.is_omitted {
+        return Ok(());
+    }
+    let decoration_ansi_term_style;
+    let draw_fn = match config.hunk_header_style.decoration_style {
+        DecorationStyle::Box(style) => {
+            decoration_ansi_term_style = style;
+            draw::write_boxed
+        }
+        DecorationStyle::BoxWithUnderline(style) => {
+            decoration_ansi_term_style = style;
+            draw::write_boxed_with_underline
+        }
+        DecorationStyle::BoxWithOverline(style) => {
+            decoration_ansi_term_style = style;
+            draw::write_boxed // TODO: not implemented
+        }
+        DecorationStyle::BoxWithUnderOverline(style) => {
+            decoration_ansi_term_style = style;
+            draw::write_boxed // TODO: not implemented
+        }
+        DecorationStyle::Underline(style) => {
+            decoration_ansi_term_style = style;
+            draw::write_underlined
+        }
+        DecorationStyle::Overline(style) => {
+            decoration_ansi_term_style = style;
+            draw::write_overlined
+        }
+        DecorationStyle::UnderOverline(style) => {
+            decoration_ansi_term_style = style;
+            draw::write_underoverlined
+        }
+        DecorationStyle::NoDecoration => {
+            decoration_ansi_term_style = ansi_term::Style::new();
+            draw::write_no_decoration
+        }
     };
-    let ansi_style = Blue.normal();
-    let (code_fragment, line_number) = parse::parse_hunk_metadata(&line);
-    if !code_fragment.is_empty() {
-        let syntax_style_sections = Painter::get_line_syntax_style_sections(
-            code_fragment,
-            &mut painter.highlighter,
-            &painter.config,
-            true,
-        );
-        Painter::paint_lines(
-            &mut painter.output_buffer,
-            vec![syntax_style_sections],
-            vec![vec![(
-                style::NO_BACKGROUND_COLOR_STYLE_MODIFIER,
-                code_fragment,
-            )]],
-            config,
-            style::NO_BACKGROUND_COLOR_STYLE_MODIFIER,
-            false,
-        );
-        painter.output_buffer.pop(); // trim newline
+    let (raw_code_fragment, line_numbers) = parse::parse_hunk_header(&line);
+    // Emit the hunk header, with any requested decoration
+    if config.hunk_header_style.is_raw {
+        if config.hunk_header_style.decoration_style != DecorationStyle::NoDecoration {
+            writeln!(painter.writer)?;
+        }
         draw_fn(
             painter.writer,
-            &painter.output_buffer,
-            config.terminal_width,
-            ansi_style,
-            false,
+            &format!("{} ", line),
+            &format!("{} ", raw_line),
+            &config.decorations_width,
+            config.hunk_header_style,
+            decoration_ansi_term_style,
         )?;
-        painter.output_buffer.clear();
+    } else {
+        let line = match painter.prepare(&raw_code_fragment, false) {
+            s if s.len() > 0 => format!("{} ", s),
+            s => s,
+        };
+        writeln!(painter.writer)?;
+        if !line.is_empty() {
+            let lines = vec![(line, State::HunkHeader)];
+            let syntax_style_sections = Painter::get_syntax_style_sections_for_lines(
+                &lines,
+                &State::HunkHeader,
+                &mut painter.highlighter,
+                &painter.config,
+            );
+            Painter::paint_lines(
+                syntax_style_sections,
+                vec![vec![(config.hunk_header_style, &lines[0].0)]], // TODO: compute style from state
+                [State::HunkHeader].iter(),
+                &mut painter.output_buffer,
+                config,
+                &mut None,
+                "",
+                None,
+                Some(false),
+            );
+            painter.output_buffer.pop(); // trim newline
+            draw_fn(
+                painter.writer,
+                &painter.output_buffer,
+                &painter.output_buffer,
+                &config.decorations_width,
+                config.hunk_header_style,
+                decoration_ansi_term_style,
+            )?;
+            if !config.hunk_header_style.is_raw {
+                painter.output_buffer.clear()
+            };
+        }
+    };
+    // Emit a single line number, or prepare for full line-numbering
+    if config.line_numbers {
+        painter
+            .line_numbers_data
+            .initialize_hunk(line_numbers, plus_file.to_string());
+    } else {
+        let plus_line_number = line_numbers[line_numbers.len() - 1].0;
+        let formatted_plus_line_number = if config.hyperlinks {
+            features::hyperlinks::format_osc8_file_hyperlink(
+                plus_file,
+                Some(plus_line_number),
+                &format!("{}", plus_line_number),
+                config,
+            )
+        } else {
+            Cow::from(format!("{}", plus_line_number))
+        };
+        match config.hunk_header_style.decoration_ansi_term_style() {
+            Some(style) => writeln!(
+                painter.writer,
+                "{}",
+                style.paint(formatted_plus_line_number)
+            )?,
+            None => writeln!(painter.writer, "{}", formatted_plus_line_number)?,
+        }
     }
-    writeln!(painter.writer, "\n{}", ansi_style.paint(line_number))?;
     Ok(())
 }
 
@@ -210,167 +501,74 @@ fn handle_hunk_meta_line(
 // minus and plus lines jointly, in order to paint detailed
 // highlighting according to inferred edit operations. In the case of
 // an unchanged line, we paint it immediately.
-fn handle_hunk_line(painter: &mut Painter, line: &str, state: State, config: &Config) -> State {
+fn handle_hunk_line(
+    painter: &mut Painter,
+    line: &str,
+    raw_line: &str,
+    state: State,
+    config: &Config,
+) -> State {
     // Don't let the line buffers become arbitrarily large -- if we
     // were to allow that, then for a large deleted/added file we
     // would process the entire file before painting anything.
     if painter.minus_lines.len() > config.max_buffered_lines
         || painter.plus_lines.len() > config.max_buffered_lines
     {
-        painter.paint_buffered_lines();
+        painter.paint_buffered_minus_and_plus_lines();
     }
     match line.chars().next() {
         Some('-') => {
-            if state == State::HunkPlus {
-                painter.paint_buffered_lines();
+            if let State::HunkPlus(_) = state {
+                painter.paint_buffered_minus_and_plus_lines();
             }
-            painter.minus_lines.push(prepare(&line, config.tab_width));
-            State::HunkMinus
+            let state = match config.inspect_raw_lines {
+                cli::InspectRawLines::True
+                    if style::line_has_style_other_than(
+                        raw_line,
+                        [*style::GIT_DEFAULT_MINUS_STYLE, config.git_minus_style].iter(),
+                    ) =>
+                {
+                    State::HunkMinus(Some(painter.prepare_raw_line(raw_line)))
+                }
+                _ => State::HunkMinus(None),
+            };
+            painter
+                .minus_lines
+                .push((painter.prepare(&line, true), state.clone()));
+            state
         }
         Some('+') => {
-            painter.plus_lines.push(prepare(&line, config.tab_width));
-            State::HunkPlus
+            let state = match config.inspect_raw_lines {
+                cli::InspectRawLines::True
+                    if style::line_has_style_other_than(
+                        raw_line,
+                        [*style::GIT_DEFAULT_PLUS_STYLE, config.git_plus_style].iter(),
+                    ) =>
+                {
+                    State::HunkPlus(Some(painter.prepare_raw_line(raw_line)))
+                }
+                _ => State::HunkPlus(None),
+            };
+            painter
+                .plus_lines
+                .push((painter.prepare(&line, true), state.clone()));
+            state
         }
-        _ => {
-            painter.paint_buffered_lines();
-            let line = prepare(&line, config.tab_width);
-            let syntax_style_sections = Painter::get_line_syntax_style_sections(
-                &line,
-                &mut painter.highlighter,
-                &painter.config,
-                true,
-            );
-            Painter::paint_lines(
-                &mut painter.output_buffer,
-                vec![syntax_style_sections],
-                vec![vec![(style::NO_BACKGROUND_COLOR_STYLE_MODIFIER, &line)]],
-                config,
-                style::NO_BACKGROUND_COLOR_STYLE_MODIFIER,
-                true,
-            );
+        Some(' ') => {
+            painter.paint_buffered_minus_and_plus_lines();
+            painter.paint_zero_line(&line);
             State::HunkZero
         }
-    }
-}
-
-/// Replace initial -/+ character with ' ', expand tabs as spaces, and terminate with newline.
-// Terminating with newline character is necessary for many of the sublime syntax definitions to
-// highlight correctly.
-// See https://docs.rs/syntect/3.2.0/syntect/parsing/struct.SyntaxSetBuilder.html#method.add_from_folder
-fn prepare(line: &str, tab_width: usize) -> String {
-    if !line.is_empty() {
-        let mut line = line.graphemes(true).peekable();
-        let mut left_fill = "".to_string();
-
-        // The first column contains a -/+/space character, added by git. Replace it with a space.
-        left_fill.push_str(" ");
-        line.next();
-
-        // Expand tabs as spaces
-        if tab_width > 0 {
-            // tab_width = 0 is documented to mean do not replace tabs.
-            let n_tabs = line.peeking_take_while(|c| *c == "\t").count();
-            if n_tabs > 0 {
-                left_fill.push_str(&" ".repeat(tab_width * n_tabs));
-            }
+        _ => {
+            // The first character here could be e.g. '\' from '\ No newline at end of file'. This
+            // is not a hunk line, but the parser does not have a more accurate state corresponding
+            // to this.
+            painter.paint_buffered_minus_and_plus_lines();
+            painter
+                .output_buffer
+                .push_str(&painter.expand_tabs(raw_line.graphemes(true)));
+            painter.output_buffer.push_str("\n");
+            State::HunkZero
         }
-        format!("{}{}\n", &left_fill, line.collect::<String>())
-    } else {
-        "\n".to_string()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use console::strip_ansi_codes;
-    use structopt::StructOpt;
-
-    #[test]
-    fn test_added_file() {
-        let input = "\
-commit d28dc1ac57e53432567ec5bf19ad49ff90f0f7a5
-Author: Dan Davison <dandavison7@gmail.com>
-Date:   Thu Jul 11 10:41:11 2019 -0400
-
-    .
-
-diff --git a/a.py b/a.py
-new file mode 100644
-index 0000000..8c55b7d
---- /dev/null
-+++ b/a.py
-@@ -0,0 +1,3 @@
-+# hello
-+class X:
-+    pass";
-
-        let expected_output = "\
-commit d28dc1ac57e53432567ec5bf19ad49ff90f0f7a5
-Author: Dan Davison <dandavison7@gmail.com>
-Date:   Thu Jul 11 10:41:11 2019 -0400
-
-    .
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-added: a.py
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-────────────────────────────────────────────────────────────────────────────────
-
-────────────────────────────────────────────────────────────────────────────────
- # hello
- class X:
-     pass
-";
-
-        let mut opt = cli::Opt::from_args();
-        opt.width = Some("variable".to_string());
-        let assets = HighlightingAssets::new();
-        let config = cli::process_command_line_arguments(&assets, &opt);
-        let mut writer: Vec<u8> = Vec::new();
-        delta(
-            input.split("\n").map(String::from),
-            &config,
-            &assets,
-            &mut writer,
-        )
-        .unwrap();
-        let output = strip_ansi_codes(&String::from_utf8(writer).unwrap()).to_string();
-        assert!(output.contains("\nadded: a.py\n"));
-        if false {
-            // TODO: hline width
-            assert_eq!(output, expected_output);
-        }
-    }
-
-    #[test]
-    fn test_renamed_file() {
-        let input = "\
-commit 1281650789680f1009dfff2497d5ccfbe7b96526
-Author: Dan Davison <dandavison7@gmail.com>
-Date:   Wed Jul 17 20:40:23 2019 -0400
-
-    rename
-
-diff --git a/a.py b/b.py
-similarity index 100%
-rename from a.py
-rename to b.py
-";
-
-        let mut opt = cli::Opt::from_args();
-        opt.width = Some("variable".to_string());
-        let assets = HighlightingAssets::new();
-        let config = cli::process_command_line_arguments(&assets, &opt);
-        let mut writer: Vec<u8> = Vec::new();
-        delta(
-            input.split("\n").map(String::from),
-            &config,
-            &assets,
-            &mut writer,
-        )
-        .unwrap();
-        let output = strip_ansi_codes(&String::from_utf8(writer).unwrap()).to_string();
-        assert!(output.contains("\nrenamed: a.py ⟶   b.py\n"));
     }
 }

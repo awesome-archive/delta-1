@@ -1,13 +1,18 @@
 // https://github.com/sharkdp/bat a1b9334a44a2c652f52dddaa83dbacba57372468
 // src/output.rs
 // See src/bat/LICENSE
-use std::env;
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
 use shell_words;
+
+use super::less::retrieve_less_version;
+
+use crate::config;
+use crate::env;
+use crate::features::navigate;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
@@ -24,22 +29,30 @@ pub enum OutputType {
 }
 
 impl OutputType {
-    pub fn from_mode(mode: PagingMode, pager: Option<&str>) -> Result<Self> {
+    pub fn from_mode(
+        mode: PagingMode,
+        pager: Option<&str>,
+        config: &config::Config,
+    ) -> Result<Self> {
         use self::PagingMode::*;
         Ok(match mode {
-            Always => OutputType::try_pager(false, pager)?,
-            QuitIfOneScreen => OutputType::try_pager(true, pager)?,
+            Always => OutputType::try_pager(false, pager, config)?,
+            QuitIfOneScreen => OutputType::try_pager(true, pager, config)?,
             _ => OutputType::stdout(),
         })
     }
 
     /// Try to launch the pager. Fall back to stdout in case of errors.
-    fn try_pager(quit_if_one_screen: bool, pager_from_config: Option<&str>) -> Result<Self> {
+    fn try_pager(
+        quit_if_one_screen: bool,
+        pager_from_config: Option<&str>,
+        config: &config::Config,
+    ) -> Result<Self> {
         let mut replace_arguments_to_less = false;
 
-        let pager_from_env = match (env::var("BAT_PAGER"), env::var("PAGER")) {
-            (Ok(bat_pager), _) => Some(bat_pager),
-            (_, Ok(pager)) => {
+        let pager_from_env = match (env::get_env_var("BAT_PAGER"), env::get_env_var("PAGER")) {
+            (Some(bat_pager), _) => Some(bat_pager),
+            (_, Some(pager)) => {
                 // less needs to be called with the '-R' option in order to properly interpret the
                 // ANSI color sequences printed by bat. If someone has set PAGER="less -F", we
                 // therefore need to overwrite the arguments and add '-R'.
@@ -78,7 +91,27 @@ impl OutputType {
                 let mut process = if is_less {
                     let mut p = Command::new(&pager_path);
                     if args.is_empty() || replace_arguments_to_less {
-                        p.args(vec!["--RAW-CONTROL-CHARS", "--no-init"]);
+                        p.args(vec!["--RAW-CONTROL-CHARS"]);
+
+                        // Passing '--no-init' fixes a bug with '--quit-if-one-screen' in older
+                        // versions of 'less'. Unfortunately, it also breaks mouse-wheel support.
+                        //
+                        // See: http://www.greenwoodsoftware.com/less/news.530.html
+                        //
+                        // For newer versions (530 or 558 on Windows), we omit '--no-init' as it
+                        // is not needed anymore.
+                        match retrieve_less_version() {
+                            None => {
+                                p.arg("--no-init");
+                            }
+                            Some(version)
+                                if (version < 530 || (cfg!(windows) && version < 558)) =>
+                            {
+                                p.arg("--no-init");
+                            }
+                            _ => {}
+                        }
+
                         if quit_if_one_screen {
                             p.arg("--quit-if-one-screen");
                         }
@@ -92,8 +125,11 @@ impl OutputType {
                     p.args(args);
                     p
                 };
-
+                if config.navigate {
+                    process.args(&["--pattern", &navigate::make_navigate_regexp(&config)]);
+                }
                 Ok(process
+                    .env("LESSANSIENDCHARS", "mK")
                     .stdin(Stdio::piped())
                     .spawn()
                     .map(OutputType::Pager)
